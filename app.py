@@ -1,11 +1,12 @@
 import streamlit as st
 import requests
 import pandas as pd
+from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="KankaBot | Solana Meme Tarayıcı", page_icon="🤖", layout="wide")
 st.title("🤖 KankaBot — Solana Memecoin Tarayıcı")
-st.caption("V3: yeni token profillerini tarar, DexScreener verilerini puanlar ve sanal işlemler sunar. Gerçek cüzdan/emir bağlantısı yoktur.")
+st.caption("V5: otomatik sanal tarama ve AL/SAT, DexScreener verilerini puanlar ve sanal işlemler sunar. Gerçek cüzdan/emir bağlantısı yoktur.")
 
 API = "https://api.dexscreener.com"
 TIMEOUT = 15
@@ -112,6 +113,14 @@ with st.sidebar:
     stop_loss = st.slider("Zarar durdurma (%)", min_value=3, max_value=50, value=15)
     take_profit = st.slider("Kâr alma (%)", min_value=5, max_value=200, value=30)
     st.warning("Puanlar yalnızca basit filtre göstergesidir. Kâr tahmini veya garantisi değildir.")
+    auto_mode = st.toggle("🤖 Otomatik sanal AL/SAT", value=False)
+    auto_interval = st.selectbox("Otomatik kontrol aralığı", [15, 30, 60], index=0, format_func=lambda x: f"{x} saniye")
+    max_positions = st.number_input("Maksimum açık pozisyon", min_value=1, max_value=5, value=2)
+    min_auto_score = st.slider("Otomatik AL için minimum puan", 50, 95, 75)
+    st.caption("Bu yalnızca sanal hesaptır. Gerçek cüzdana emir göndermez.")
+
+if auto_mode:
+    st_autorefresh(interval=auto_interval * 1000, key="kankabot_auto_refresh")
 
 if st.button("Sanal hesabı sıfırla"):
     st.session_state.balance = float(start_balance)
@@ -197,6 +206,96 @@ if st.session_state.scan_results:
                 st.error("Seçilen token için market bulunamadı.")
         except Exception as e:
             st.error(f"Token verisi alınamadı: {e}")
+
+# Otomatik SANAL strateji döngüsü: scan + fiyat yenile + TP/SL çık + puanlı AL.
+if auto_mode:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    last_ts = st.session_state.get("auto_last_cycle", 0)
+    if now_ts - last_ts >= auto_interval:
+        st.session_state.auto_last_cycle = now_ts
+        auto_events = []
+        # Güncel token profillerinden tarama evreni oluştur
+        try:
+            profiles = latest_profiles()
+            auto_candidates = []
+            seen_mints = set()
+            for item in profiles:
+                if item.get("chainId") != "solana":
+                    continue
+                candidate_mint = item.get("tokenAddress")
+                if not candidate_mint or candidate_mint in seen_mints:
+                    continue
+                seen_mints.add(candidate_mint)
+                try:
+                    fresh_pairs = token_pairs.__wrapped__(candidate_mint)
+                    candidate_pair = choose_solana_pair(fresh_pairs)
+                    if not candidate_pair:
+                        continue
+                    candidate_score, candidate_warning, candidate_age = score_pair(candidate_pair)
+                    candidate_liq = num((candidate_pair.get("liquidity") or {}).get("usd"))
+                    candidate_vol1 = num((candidate_pair.get("volume") or {}).get("h1"))
+                    candidate_change1 = num((candidate_pair.get("priceChange") or {}).get("h1"))
+                    tx1 = (candidate_pair.get("txns") or {}).get("h1") or {}
+                    buys1, sells1 = num(tx1.get("buys")), num(tx1.get("sells"))
+                    auto_candidates.append((candidate_score, candidate_mint, candidate_pair, candidate_liq, candidate_vol1, candidate_change1, buys1, sells1))
+                except Exception:
+                    continue
+                if len(auto_candidates) >= scan_count:
+                    break
+        except Exception as e:
+            auto_events.append(f"Tarama API hatası: {e}")
+            auto_candidates = []
+
+        # Açık pozisyonların son fiyatlarını getir ve sanal TP/SL uygulaması yap
+        for open_mint, open_pos in list(st.session_state.positions.items()):
+            try:
+                fresh_pairs = token_pairs.__wrapped__(open_mint)
+                fresh_pair = choose_solana_pair(fresh_pairs)
+                if not fresh_pair or num(fresh_pair.get("priceUsd")) <= 0:
+                    continue
+                st.session_state.position_market_prices[open_mint] = fresh_pair
+                open_price = num(fresh_pair.get("priceUsd"))
+                change_pct = (open_price / open_pos["entry"] - 1) * 100 if open_pos.get("entry") else 0
+                if change_pct <= -stop_loss or change_pct >= take_profit:
+                    proceeds = open_pos["qty"] * open_price
+                    pnl = proceeds - open_pos["cost"]
+                    st.session_state.balance += proceeds
+                    st.session_state.history.append({"Saat": datetime.now().strftime("%H:%M:%S"), "İşlem": "OTOMATİK SANAL SAT", "Token": open_pos["symbol"], "Fiyat": open_price, "Tutar": proceeds, "K/Z": pnl})
+                    del st.session_state.positions[open_mint]
+                    st.session_state.position_market_prices.pop(open_mint, None)
+                    auto_events.append(f"{open_pos['symbol']} sanal satıldı; K/Z ${pnl:+.2f} (TP/SL).")
+            except Exception:
+                continue
+
+        # Sanal alım kriterleri: minimum puan, likidite, hacim, alım/satım akışı, ani pump eleme
+        if len(st.session_state.positions) < max_positions and st.session_state.balance >= trade_size:
+            auto_candidates.sort(key=lambda x: x[0], reverse=True)
+            for candidate in auto_candidates:
+                score, candidate_mint, candidate_pair, liq, vol1, change1, buys1, sells1 = candidate
+                if candidate_mint in st.session_state.positions:
+                    continue
+                if score < min_auto_score or liq < 15000 or vol1 < 5000:
+                    continue
+                if buys1 <= sells1 or change1 > 50 or change1 < -20:
+                    continue
+                auto_price = num(candidate_pair.get("priceUsd"))
+                if auto_price <= 0:
+                    continue
+                token_info = candidate_pair.get("baseToken") or {}
+                auto_symbol = token_info.get("symbol") or candidate_mint[:8]
+                auto_name = token_info.get("name") or "Token"
+                auto_qty = trade_size / auto_price
+                st.session_state.balance -= trade_size
+                st.session_state.positions[candidate_mint] = {"name": auto_name, "symbol": auto_symbol, "entry": auto_price, "qty": auto_qty, "cost": trade_size}
+                st.session_state.position_market_prices[candidate_mint] = candidate_pair
+                st.session_state.history.append({"Saat": datetime.now().strftime("%H:%M:%S"), "İşlem": "OTOMATİK SANAL AL", "Token": auto_symbol, "Fiyat": auto_price, "Tutar": trade_size})
+                auto_events.append(f"{auto_symbol} sanal alındı — puan {score}, ${trade_size:.2f}.")
+                if len(st.session_state.positions) >= max_positions or st.session_state.balance < trade_size:
+                    break
+        if auto_events:
+            st.info("Otomatik döngü: " + " | ".join(auto_events))
+        else:
+            st.caption("Otomatik döngü tamamlandı: bu turda yeni sanal işlem yok.")
 
 st.divider()
 st.subheader("2) İstersen adresi elle kontrol et")
@@ -332,4 +431,4 @@ if st.session_state.history:
     st.subheader("İşlem geçmişi")
     st.dataframe(pd.DataFrame(st.session_state.history), use_container_width=True, hide_index=True)
 
-st.caption("Veri kaynağı: DexScreener public API. Puan sistemi basit filtreleme içindir; otomatik strateji, gerçek emir sistemi veya kâr garantisi değildir. API verileri gecikmeli/eksik olabilir. Sanal K/Z ücretleri hesaba katmaz. Seed phrase/private key girme.")
+st.caption("Veri kaynağı: DexScreener public API. Puan sistemi basit filtreleme içindir; gerçek emir sistemi veya kâr garantisi değildir. Otomatik mod yalnızca sanal AL/SAT yapar. API verileri gecikmeli/eksik olabilir. Sanal K/Z ücretleri hesaba katmaz. Seed phrase/private key girme.")
