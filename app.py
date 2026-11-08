@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 st.set_page_config(page_title="KankaBot | Solana Meme Tarayıcı", page_icon="🤖", layout="wide")
 st.title("🤖 KankaBot — Solana Memecoin Tarayıcı")
-st.caption("V2: yeni token profillerini tarar, DexScreener verilerini puanlar ve sanal işlemler sunar. Gerçek cüzdan/emir bağlantısı yoktur.")
+st.caption("V3: yeni token profillerini tarar, DexScreener verilerini puanlar ve sanal işlemler sunar. Gerçek cüzdan/emir bağlantısı yoktur.")
 
 API = "https://api.dexscreener.com"
 TIMEOUT = 15
@@ -20,6 +20,8 @@ if "current_pair" not in st.session_state:
     st.session_state.current_pair = None
 if "scan_results" not in st.session_state:
     st.session_state.scan_results = []
+if "position_market_prices" not in st.session_state:
+    st.session_state.position_market_prices = {}
 
 @st.cache_data(ttl=90, show_spinner=False)
 def latest_profiles():
@@ -215,14 +217,39 @@ if st.button("Adresin piyasa verisini getir", disabled=not token.strip()):
 pair = st.session_state.get("current_pair")
 mint = st.session_state.get("current_mint", token.strip() if token else "")
 
-# Fiyatı kullanıcı isteğiyle güncelle; Streamlit Cloud her rerun'da API çağrısı yapmasın.
+# Kullanıcı tıklamasıyla fiyat yenileme. Cache dışından DexScreener verisi alınır.
+if st.session_state.positions:
+    if st.button("🔄 Tüm açık pozisyonların fiyatını yenile"):
+        updated = 0
+        errors = []
+        for pos_mint in list(st.session_state.positions.keys()):
+            try:
+                fresh_pairs = token_pairs.__wrapped__(pos_mint)
+                fresh_pair = choose_solana_pair(fresh_pairs)
+                if fresh_pair and num(fresh_pair.get("priceUsd")) > 0:
+                    st.session_state.position_market_prices[pos_mint] = fresh_pair
+                    updated += 1
+                else:
+                    errors.append(st.session_state.positions[pos_mint]["symbol"])
+            except Exception:
+                errors.append(st.session_state.positions[pos_mint]["symbol"])
+        if mint and st.session_state.get("current_mint") in st.session_state.position_market_prices:
+            st.session_state.current_pair = st.session_state.position_market_prices[st.session_state.current_mint]
+        if updated:
+            st.success(f"{updated} açık pozisyonun fiyatı güncellendi.")
+        if errors:
+            st.warning("Verisi alınamayanlar: " + ", ".join(errors))
+        st.rerun()
+
 if pair and mint:
     if st.button("🔄 Seçili market fiyatını yenile"):
         try:
-            fresh_pairs = token_pairs.__wrapped__(mint)  # cache dışından güncel veriyi çek
+            fresh_pairs = token_pairs.__wrapped__(mint)
             fresh_pair = choose_solana_pair(fresh_pairs)
             if fresh_pair:
                 st.session_state.current_pair = fresh_pair
+                if mint in st.session_state.positions:
+                    st.session_state.position_market_prices[mint] = fresh_pair
                 st.success("Fiyat güncellendi.")
                 st.rerun()
             else:
@@ -251,6 +278,7 @@ if pair:
             qty = trade_size / price
             st.session_state.balance -= trade_size
             st.session_state.positions[mint] = {"name": name, "symbol": symbol, "entry": price, "qty": qty, "cost": trade_size}
+            st.session_state.position_market_prices[mint] = pair
             st.session_state.history.append({"Saat": datetime.now().strftime("%H:%M:%S"), "İşlem": "AL", "Token": symbol, "Fiyat": price, "Tutar": trade_size})
             st.rerun()
     with sell_col:
@@ -261,6 +289,7 @@ if pair:
             st.session_state.balance += proceeds
             st.session_state.history.append({"Saat": datetime.now().strftime("%H:%M:%S"), "İşlem": "SAT", "Token": symbol, "Fiyat": price, "Tutar": proceeds, "K/Z": pnl})
             del st.session_state.positions[mint]
+            st.session_state.position_market_prices.pop(mint, None)
             st.rerun()
 
     pos = st.session_state.positions.get(mint)
@@ -283,7 +312,9 @@ b.metric("Açık pozisyon sayısı", len(st.session_state.positions))
 total_unrealized = 0.0
 portfolio_rows = []
 for pos_mint, pos_data in st.session_state.positions.items():
-    market_pair = st.session_state.current_pair if pos_mint == st.session_state.get("current_mint") else None
+    market_pair = st.session_state.position_market_prices.get(pos_mint)
+    if pos_mint == st.session_state.get("current_mint") and st.session_state.current_pair:
+        market_pair = st.session_state.current_pair
     current_price = num(market_pair.get("priceUsd")) if market_pair else pos_data.get("entry", 0.0)
     unrealized = pos_data["qty"] * current_price - pos_data["cost"]
     pct_unrealized = (current_price / pos_data["entry"] - 1) * 100 if pos_data.get("entry") else 0.0
