@@ -162,7 +162,7 @@ if st.button("Yeni memecoinleri tara", type="primary"):
                         "Pair adresi": pair.get("pairAddress", ""),
                     })
                 except Exception:
-                    # Bir profilin market verisi bozuk/ulaşılamazsa diğerlerini taramaya devam et.
+                    # Tek tokenin API hatası tüm taramayı durdurmasın.
                     continue
         st.session_state.scan_results = sorted(results, key=lambda x: x["Puan"], reverse=True)
         if st.session_state.scan_results:
@@ -214,6 +214,22 @@ if st.button("Adresin piyasa verisini getir", disabled=not token.strip()):
 
 pair = st.session_state.get("current_pair")
 mint = st.session_state.get("current_mint", token.strip() if token else "")
+
+# Fiyatı kullanıcı isteğiyle güncelle; Streamlit Cloud her rerun'da API çağrısı yapmasın.
+if pair and mint:
+    if st.button("🔄 Seçili market fiyatını yenile"):
+        try:
+            fresh_pairs = token_pairs.__wrapped__(mint)  # cache dışından güncel veriyi çek
+            fresh_pair = choose_solana_pair(fresh_pairs)
+            if fresh_pair:
+                st.session_state.current_pair = fresh_pair
+                st.success("Fiyat güncellendi.")
+                st.rerun()
+            else:
+                st.warning("Güncel market verisi bulunamadı.")
+        except Exception as e:
+            st.error(f"Fiyat yenilenemedi: {e}")
+
 if pair:
     price = num(pair.get("priceUsd"))
     liquidity = num((pair.get("liquidity") or {}).get("usd"))
@@ -262,10 +278,27 @@ st.subheader("3) Sanal hesap özeti")
 a, b = st.columns(2)
 a.metric("Kullanılabilir sanal bakiye", f"${st.session_state.balance:.2f}")
 b.metric("Açık pozisyon sayısı", len(st.session_state.positions))
+
+# Mevcut pozisyonların kayıtlı giriş fiyatına göre K/Z; fiyatlar son yüklenen veridir.
+total_unrealized = 0.0
+portfolio_rows = []
+for pos_mint, pos_data in st.session_state.positions.items():
+    market_pair = st.session_state.current_pair if pos_mint == st.session_state.get("current_mint") else None
+    current_price = num(market_pair.get("priceUsd")) if market_pair else pos_data.get("entry", 0.0)
+    unrealized = pos_data["qty"] * current_price - pos_data["cost"]
+    pct_unrealized = (current_price / pos_data["entry"] - 1) * 100 if pos_data.get("entry") else 0.0
+    total_unrealized += unrealized
+    portfolio_rows.append({"Token": pos_data["symbol"], "Maliyet ($)": pos_data["cost"], "Son fiyat ($)": current_price, "Açık K/Z ($)": unrealized, "K/Z (%)": pct_unrealized})
+c, d = st.columns(2)
+c.metric("Açık pozisyonların toplam K/Z", f"${total_unrealized:+.2f}")
+d.metric("Sanal toplam varlık (yaklaşık)", f"${st.session_state.balance + sum(r['Maliyet ($)'] + r['Açık K/Z ($)'] for r in portfolio_rows):.2f}")
+if portfolio_rows:
+    st.dataframe(pd.DataFrame(portfolio_rows), use_container_width=True, hide_index=True)
+
 if st.session_state.positions:
     st.dataframe(pd.DataFrame([{"Token": v["symbol"], "Giriş": v["entry"], "Miktar": v["qty"], "Maliyet": v["cost"]} for v in st.session_state.positions.values()]), use_container_width=True, hide_index=True)
 if st.session_state.history:
     st.subheader("İşlem geçmişi")
     st.dataframe(pd.DataFrame(st.session_state.history), use_container_width=True, hide_index=True)
 
-st.caption("Veri kaynağı: DexScreener public API. Puan sistemi basit filtreleme içindir; otomatik strateji, gerçek emir sistemi veya kâr garantisi değildir. API verileri gecikmeli/eksik olabilir. Seed phrase/private key girme.")
+st.caption("Veri kaynağı: DexScreener public API. Puan sistemi basit filtreleme içindir; otomatik strateji, gerçek emir sistemi veya kâr garantisi değildir. API verileri gecikmeli/eksik olabilir. Sanal K/Z ücretleri hesaba katmaz. Seed phrase/private key girme.")
